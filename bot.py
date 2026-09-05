@@ -1,11 +1,13 @@
 import os
+import time
 import logging
 import aiohttp
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 import yt_dlp
+from aiohttp import web
 
-# ലോങ്ങിങ് സെറ്റപ്പ്
+# Logging Setup
 logging.basicConfig(level=logging.INFO)
 
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -20,15 +22,35 @@ app = Client("LeechBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 USER_THUMBNAILS = {}
 WAITING_FOR_THUMB = set()
 
-# ഗ്രൂപ്പിലെ അഡ്മിൻ ആണോ എന്ന് പരിശോധിക്കാനുള്ള ഫങ്ഷൻ
-async def is_admin(client: Client, chat_id: int, user_id: int) -> bool:
-    try:
-        member = await client.get_chat_member(chat_id, user_id)
-        return member.status in ["creator", "administrator"]
-    except Exception:
-        return False
+# Keep Alive Web Server for Render
+async def web_handler(request):
+    return web.Response(text="Bot is Live! 🚀")
 
-# 1. /usetting കമാൻഡ് (തംബ്‌നെയിൽ സെറ്റ് ചെയ്യാൻ)
+async def start_web_server():
+    web_app = web.Application()
+    web_app.add_routes([web.get("/", web_handler)])
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"Web server started on port {port}")
+
+# Progress bar function
+def human_bytes(size):
+    units = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    while size >= 1024 and i < len(units) - 1:
+        size /= 1024
+        i += 1
+    return f"{size:.2f} {units[i]}"
+
+# 0. /start Command
+@app.on_message(filters.command("start") & filters.chat(ALLOWED_GROUP_ID))
+async def start_handler(client: Client, message: Message):
+    await message.reply_text("🤖 Hello! I am Leech Bot. Ready to help you download and manage files!")
+
+# 1. /usetting Command
 @app.on_message(filters.command("usetting") & filters.chat(ALLOWED_GROUP_ID))
 async def usetting_handler(client: Client, message: Message):
     user_id = message.from_user.id
@@ -41,7 +63,7 @@ async def usetting_handler(client: Client, message: Message):
     
     await message.reply_text(
         "⚙️ **User Personal Settings**\n\n"
-        "നിങ്ങളുടെ ഡൗൺലോഡുകൾക്കായുള്ള തംബ്‌നെയിൽ ഇവിടെ ക്രമീകരിക്കാം:",
+        "Configure your personal thumbnail here:",
         reply_markup=keyboard
     )
 
@@ -53,8 +75,8 @@ async def callback_handler(client: Client, callback_query: CallbackQuery):
     if data == "set_thumb":
         WAITING_FOR_THUMB.add(user_id)
         await callback_query.message.edit_text(
-            "🖼️ ദയവായി നിങ്ങളുടെ പുതിയ തംബ്‌നെയിൽ ഫോട്ടോ (Image) ഈ ഗ്രൂപ്പിലേക്ക് അയക്കുക.\n"
-            "അത് ബോട്ട് ഓട്ടോമാറ്റിക്കായി തംബ്‌നെയിൽ ആയി സേവ് ചെയ്തുകൊള്ളും!"
+            "🖼️ Please send your thumbnail photo (Image) to this group.\n"
+            "The bot will automatically save it as your default thumbnail!"
         )
     elif data == "remove_thumb":
         if user_id in USER_THUMBNAILS:
@@ -64,7 +86,7 @@ async def callback_handler(client: Client, callback_query: CallbackQuery):
         if user_id in WAITING_FOR_THUMB:
             WAITING_FOR_THUMB.remove(user_id)
             
-        await callback_query.message.edit_text("🗑️ നിങ്ങളുടെ തംബ്‌നെയിൽ വിജയകരമായി നീക്കം ചെയ്തിരിക്കുന്നു!")
+        await callback_query.message.edit_text("🗑️ Your thumbnail has been successfully removed!")
 
 @app.on_message(filters.photo & filters.chat(ALLOWED_GROUP_ID))
 async def save_thumbnail(client: Client, message: Message):
@@ -75,23 +97,17 @@ async def save_thumbnail(client: Client, message: Message):
         await message.download(file_name=photo_path)
         USER_THUMBNAILS[user_id] = photo_path
         WAITING_FOR_THUMB.remove(user_id)
-        await message.reply_text("✅ തംബ്‌നെയിൽ വിജയകരമായി സേവ് ചെയ്യപ്പെട്ടിരിക്കുന്നു!")
+        await message.reply_text("✅ Thumbnail saved successfully!")
 
-# 2. /v കമാൻഡ് (അഡ്മിൻമാർക്ക് മാത്രം വെരിഫിക്കേഷൻ ലിങ്ക് ബൈപാസ് ചെയ്യാൻ)
+# 2. /v Command (Open to Everyone - No Admin restriction)
 @app.on_message(filters.command("v") & filters.chat(ALLOWED_GROUP_ID))
 async def bypass_handler(client: Client, message: Message):
-    user_id = message.from_user.id
-    
-    if not await is_admin(client, message.chat.id, user_id):
-        await message.reply_text("❌ ഈ കമാൻഡ് ഉപയോഗിക്കാൻ **അഡ്മിൻമാർക്ക്** മാത്രമേ അനുവാദമുള്ളൂ!")
-        return
-
     if len(message.command) < 2:
-        await message.reply_text("❌ ദയവായി വെരിഫിക്കേഷൻ ലിങ്ക് നൽകുക!\nഉദാഹരണത്തിന്: `/v https://vplink.in/xxxx`")
+        await message.reply_text("❌ Please provide a verification link!\nExample: `/v https://vplink.in/xxxx`")
         return
 
     url = message.command[1]
-    msg = await message.reply_text("🔍 ലിങ്ക് പരിശോധിക്കുന്നു... ദയവായി കാത്തിരിക്കുക.")
+    msg = await message.reply_text("🔍 Checking link... Please wait.")
 
     try:
         api_url = f"https://api.bypass.vip/bypass?url={url}"
@@ -113,13 +129,13 @@ async def bypass_handler(client: Client, message: Message):
         await msg.edit_text(result_text)
 
     except Exception as e:
-        await msg.edit_text(f"❌ ലിങ്ക് ബൈപാസ് ചെയ്യുന്നത് പരാജയപ്പെട്ടു!\n\n**കാരണം:** `{str(e)}`")
+        await msg.edit_text(f"❌ Failed to bypass link!\n\n**Reason:** `{str(e)}`")
 
-# 3. /leech കമാൻഡ്
+# 3. /leech Command with Progress & Details
 @app.on_message(filters.command("leech") & filters.chat(ALLOWED_GROUP_ID))
 async def leech_handler(client: Client, message: Message):
     if len(message.command) < 2:
-        await message.reply_text("❌ ദയവായി ഒരു ലിങ്ക് നൽകുക!\nഉദാഹരണത്തിന്: `/leech https://link.com`")
+        await message.reply_text("❌ Please provide a link!\nExample: `/leech https://link.com`")
         return
 
     url = message.command[1]
@@ -127,28 +143,62 @@ async def leech_handler(client: Client, message: Message):
     user_name = user.first_name if user else "Unknown"
     user_id = user.id if user else 0
 
-    status_msg = await message.reply_text("⏳ ഡൗൺലോഡ് ആരംഭിക്കുന്നു... ദയവായി കാത്തിരിക്കുക.")
+    status_msg = await message.reply_text("⏳ Initializing download... Please wait.")
 
     file_path = None
     try:
         os.makedirs("downloads", exist_ok=True)
+        last_update_time = 0
+
+        def download_progress(d):
+            nonlocal last_update_time
+            if d['status'] == 'downloading':
+                current_time = time.time()
+                if current_time - last_update_time > 3:
+                    last_update_time = current_time
+                    filename = d.get('filename', 'Video')
+                    downloaded = d.get('downloaded_bytes', 0)
+                    total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
+                    
+                    if total > 0:
+                        percentage = (downloaded / total) * 100
+                        progress_str = f"📥 **Downloading...**\n\n" \
+                                       f"📁 **File:** `{os.path.basename(filename)}`\n" \
+                                       f"📊 **Progress:** `{percentage:.1f}%`\n" \
+                                       f"📦 **Size:** `{human_bytes(downloaded)} / {human_bytes(total)}`"
+                    else:
+                        progress_str = f"📥 **Downloading...**\n\n" \
+                                       f"📁 **File:** `{os.path.basename(filename)}`\n" \
+                                       f"📦 **Downloaded:** `{human_bytes(downloaded)}`"
+                    
+                    try:
+                        client.loop.create_task(status_msg.edit_text(progress_str))
+                    except Exception:
+                        pass
 
         ydl_opts = {
             'format': 'best',
             'outtmpl': 'downloads/%(title)s.%(ext)s',
             'max_filesize': 2000 * 1024 * 1024,
+            'progress_hooks': [download_progress],
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info_dict = ydl.extract_info(url, download=True)
             file_path = ydl.prepare_filename(info_dict)
             file_title = info_dict.get('title', 'Video')
+            file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
 
-        await status_msg.edit_text("📤 ടെലഗ്രാമിലേക്ക് അപ്‌ലോഡ് ചെയ്യുന്നു...")
+        await status_msg.edit_text(
+            f"📤 **Uploading to Telegram...**\n\n"
+            f"📁 **Name:** `{file_title}`\n"
+            f"📦 **Size:** `{human_bytes(file_size)}`"
+        )
 
         caption = (
             f"<b>{file_title}</b>\n\n"
             f"👤 <b>Task By:</b> {user_name} (`{user_id}`)\n"
+            f"📦 <b>Size:</b> {human_bytes(file_size)}\n"
             f"🔗 <b>Link:</b> {url}"
         )
 
@@ -167,7 +217,8 @@ async def leech_handler(client: Client, message: Message):
             f"📥 <b>New Leech Completed!</b>\n\n"
             f"👤 <b>User:</b> {user_name} (`{user_id}`)\n"
             f"🔗 <b>URL:</b> {url}\n"
-            f"📁 <b>File:</b> {file_title}"
+            f"📁 <b>File:</b> {file_title}\n"
+            f"📦 <b>Size:</b> {human_bytes(file_size)}"
         )
         await client.send_message(chat_id=LOG_CHANNEL_ID, text=log_text)
 
@@ -176,11 +227,11 @@ async def leech_handler(client: Client, message: Message):
         await status_msg.delete()
 
     except Exception as e:
-        await status_msg.edit_text(f"❌ ഡൗൺലോഡ് പരാജയപ്പെട്ടു!\n\n**കാരണം:** `{str(e)}`")
+        await status_msg.edit_text(f"❌ **Download Failed!**\n\n**Reason:** `{str(e)}`")
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
 
 if __name__ == "__main__":
-    print("🤖 ലിച്ച് ബൂട്ട് വിജയകരമായി സ്റ്റാർട്ട് ചെയ്തു...")
+    print("🤖 Leech Bot Started Successfully...")
+    app.loop.run_until_complete(start_web_server())
     app.run()
-
