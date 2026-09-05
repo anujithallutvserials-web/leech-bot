@@ -22,6 +22,7 @@ app = Client("LeechBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 USER_THUMBNAILS = {}
 WAITING_FOR_THUMB = set()
+USER_YTDL_LINKS = {}
 
 # Keep Alive Web Server for Render
 async def web_handler(request):
@@ -46,9 +47,22 @@ def human_bytes(size):
         i += 1
     return f"{size:.2f} {units[i]}"
 
-# 0. /start Command with Admin Contact Button
-@app.on_message(filters.command("start") & filters.chat(ALLOWED_GROUP_ID))
+# 0. /start Command (Works in both DM and Group + Logs new user to LOG_CHANNEL)
+@app.on_message(filters.command("start"))
 async def start_handler(client: Client, message: Message):
+    user = message.from_user
+    if user and not user.is_bot:
+        log_msg = (
+            f"👤 <b>New User Started Bot!</b>\n\n"
+            f"<b>Name:</b> {user.first_name}\n"
+            f"<b>User ID:</b> <code>{user.id}</code>\n"
+            f"<b>Username:</b> @{user.username if user.username else 'None'}"
+        )
+        try:
+            await client.send_message(chat_id=LOG_CHANNEL_ID, text=log_msg)
+        except Exception:
+            pass
+
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("👤 Admin Contact", url="https://t.me/anujith1238")]
     ])
@@ -58,7 +72,7 @@ async def start_handler(client: Client, message: Message):
         reply_markup=keyboard
     )
 
-# 1. /usetting Command
+# 1. /usetting Command (Group only)
 @app.on_message(filters.command("usetting") & filters.chat(ALLOWED_GROUP_ID))
 async def usetting_handler(client: Client, message: Message):
     user_id = message.from_user.id
@@ -95,6 +109,16 @@ async def callback_handler(client: Client, callback_query: CallbackQuery):
             WAITING_FOR_THUMB.remove(user_id)
             
         await callback_query.message.edit_text("🗑️ Your thumbnail has been successfully removed!")
+    
+    elif data.startswith("ytdl_"):
+        format_code = data.split("_")[1]
+        url = USER_YTDL_LINKS.get(user_id)
+        if not url:
+            await callback_query.message.edit_text("❌ Link expired or not found. Please send the `/ytdl` command again.")
+            return
+
+        await callback_query.message.edit_text("⏳ Initializing download with selected quality... Please wait.")
+        await process_download(client, callback_query.message, user_id, callback_query.from_user.first_name, url, format_code)
 
 @app.on_message(filters.photo & filters.chat(ALLOWED_GROUP_ID))
 async def save_thumbnail(client: Client, message: Message):
@@ -107,25 +131,35 @@ async def save_thumbnail(client: Client, message: Message):
         WAITING_FOR_THUMB.remove(user_id)
         await message.reply_text("✅ Thumbnail saved successfully!")
 
-# 2. /v Command (Open to Everyone - No Admin restriction)
+# 2. /v Command
 @app.on_message(filters.command("v") & filters.chat(ALLOWED_GROUP_ID))
 async def bypass_handler(client: Client, message: Message):
     if len(message.command) < 2:
-        await message.reply_text("❌ Please provide a verification link!\nExample: `/v https://vplink.in/xxxx`")
+        await message.reply_text("❌ Please provide a verification link!\nExample: `/v https://shortxlinks.in/xxxx`")
         return
 
     url = message.command[1]
     msg = await message.reply_text("🔍 Checking link... Please wait.")
 
+    bypassed_link = url
     try:
-        api_url = f"https://api.bypass.vip/bypass?url={url}"
+        api_urls = [
+            f"https://api.bypass.vip/bypass?url={url}",
+            f"https://bypass.pmh.workers.dev/?url={url}"
+        ]
+        
         async with aiohttp.ClientSession() as session:
-            async with session.get(api_url) as resp:
-                if resp.status == 200:
-                    res_data = await resp.json()
-                    bypassed_link = res_data.get("destination", url)
-                else:
-                    bypassed_link = url
+            for api_url in api_urls:
+                try:
+                    async with session.get(api_url, timeout=10) as resp:
+                        if resp.status == 200:
+                            res_data = await resp.json()
+                            dest = res_data.get("destination") or res_data.get("url")
+                            if dest and dest != url:
+                                bypassed_link = dest
+                                break
+                except:
+                    continue
 
         result_text = (
             f"<b>Nick Bypass Bot</b>\n\n"
@@ -139,7 +173,7 @@ async def bypass_handler(client: Client, message: Message):
     except Exception as e:
         await msg.edit_text(f"❌ Failed to bypass link!\n\n**Reason:** `{str(e)}`")
 
-# 3. /leech Command with Progress & Details
+# 3. /leech Command
 @app.on_message(filters.command("leech") & filters.chat(ALLOWED_GROUP_ID))
 async def leech_handler(client: Client, message: Message):
     if len(message.command) < 2:
@@ -152,7 +186,36 @@ async def leech_handler(client: Client, message: Message):
     user_id = user.id if user else 0
 
     status_msg = await message.reply_text("⏳ Initializing download... Please wait.")
+    await process_download(client, status_msg, user_id, user_name, url, 'best')
 
+# 4. /ytdl & /yt Command
+@app.on_message((filters.command("ytdl") | filters.command("yt")) & filters.chat(ALLOWED_GROUP_ID))
+async def ytdl_handler(client: Client, message: Message):
+    if len(message.command) < 2:
+        await message.reply_text("❌ Please provide a YouTube link!\nExample: `/ytdl https://youtu.be/xxxx`")
+        return
+
+    url = message.command[1]
+    user_id = message.from_user.id
+    USER_YTDL_LINKS[user_id] = url
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📥 144p", callback_data="ytdl_144")],
+        [InlineKeyboardButton("📥 240p", callback_data="ytdl_240")],
+        [InlineKeyboardButton("📥 360p", callback_data="ytdl_360")],
+        [InlineKeyboardButton("📥 480p", callback_data="ytdl_480")],
+        [InlineKeyboardButton("📥 720p", callback_data="ytdl_720")],
+        [InlineKeyboardButton("📥 1080p", callback_data="ytdl_1080")],
+        [InlineKeyboardButton("🎵 MP3 Audio", callback_data="ytdl_mp3")]
+    ])
+
+    await message.reply_text(
+        "👇 **Select video formatni tanlang:**",
+        reply_markup=keyboard
+    )
+
+# Common Download & Upload Function (Group First Flow)
+async def process_download(client, status_msg, user_id, user_name, url, quality):
     file_path = None
     try:
         os.makedirs("downloads", exist_ok=True)
@@ -184,48 +247,93 @@ async def leech_handler(client: Client, message: Message):
                     except Exception:
                         pass
 
-        ydl_opts = {
-            'format': 'best',
-            'outtmpl': 'downloads/%(title)s.%(ext)s',
-            'max_filesize': 2000 * 1024 * 1024,
-            'progress_hooks': [download_progress],
-        }
+        if quality == 'mp3':
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'outtmpl': 'downloads/%(title)s.%(ext)s',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+                'progress_hooks': [download_progress],
+            }
+        elif quality == 'best':
+            ydl_opts = {
+                'format': 'best',
+                'outtmpl': 'downloads/%(title)s.%(ext)s',
+                'max_filesize': 2000 * 1024 * 1024,
+                'progress_hooks': [download_progress],
+            }
+        else:
+            ydl_opts = {
+                'format': f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best',
+                'outtmpl': 'downloads/%(title)s.%(ext)s',
+                'max_filesize': 2000 * 1024 * 1024,
+                'progress_hooks': [download_progress],
+            }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info_dict = ydl.extract_info(url, download=True)
             file_path = ydl.prepare_filename(info_dict)
-            file_title = info_dict.get('title', 'Video')
+            if quality == 'mp3':
+                file_path = os.path.splitext(file_path)[0] + ".mp3"
+            file_title = info_dict.get('title', 'Media')
             file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
 
         await status_msg.edit_text(
-            f"📤 **Uploading to Telegram...**\n\n"
-            f"📁 **Name:** `{file_title}`\n"
+            f"📤 **Uploading to Telegram...**\n\n" \
+            f"📁 **Name:** `{file_title}`\n" \
             f"📦 **Size:** `{human_bytes(file_size)}`"
         )
 
         caption = (
-            f"<b>{file_title}</b>\n\n"
-            f"👤 <b>Task By:</b> {user_name} (`{user_id}`)\n"
-            f"📦 <b>Size:</b> {human_bytes(file_size)}\n"
+            f"<b>{file_title}</b>\n\n" \
+            f"👤 <b>Task By:</b> {user_name} (`{user_id}`)\n" \
+            f"📦 <b>Size:</b> {human_bytes(file_size)}\n" \
             f"🔗 <b>Link:</b> {url}"
         )
 
         thumb = USER_THUMBNAILS.get(user_id)
+        valid_thumb = thumb if thumb and os.path.exists(thumb) else None
 
-        sent_msg = await client.send_video(
-            chat_id=DATABASE_CHANNEL_ID,
-            video=file_path,
-            caption=caption,
-            thumb=thumb if thumb and os.path.exists(thumb) else None
+        # 1. First, send the video/audio directly to the Group
+        if quality == 'mp3':
+            sent_group_msg = await client.send_audio(
+                chat_id=status_msg.chat.id,
+                audio=file_path,
+                caption=caption,
+                thumb=valid_thumb,
+                reply_to_message_id=status_msg.reply_to_message_id
+            )
+        else:
+            sent_group_msg = await client.send_video(
+                chat_id=status_msg.chat.id,
+                video=file_path,
+                caption=caption,
+                thumb=valid_thumb,
+                reply_to_message_id=status_msg.reply_to_message_id
+            )
+
+        # 2. Send user info and details to Database Channel
+        db_info_text = (
+            f"👤 <b>User Name:</b> {user_name}\n" \
+            f"🆔 <b>User ID:</b> <code>{user_id}</code>\n" \
+            f"🔗 <b>Download URL:</b> {url}\n" \
+            f"📁 <b>File Name:</b> {file_title}\n" \
+            f"📦 <b>File Size:</b> {human_bytes(file_size)}"
         )
+        await client.send_message(chat_id=DATABASE_CHANNEL_ID, text=db_info_text)
 
-        await sent_msg.copy(chat_id=message.chat.id, reply_to_message_id=message.id)
+        # 3. Copy the video to Database Channel as well
+        await sent_group_msg.copy(chat_id=DATABASE_CHANNEL_ID)
 
+        # 4. Send log to Log Channel
         log_text = (
-            f"📥 <b>New Leech Completed!</b>\n\n"
-            f"👤 <b>User:</b> {user_name} (`{user_id}`)\n"
-            f"🔗 <b>URL:</b> {url}\n"
-            f"📁 <b>File:</b> {file_title}\n"
+            f"📥 <b>New Download Completed!</b>\n\n" \
+            f"👤 <b>User:</b> {user_name} (`{user_id}`)\n" \
+            f"🔗 <b>URL:</b> {url}\n" \
+            f"📁 <b>File:</b> {file_title}\n" \
             f"📦 <b>Size:</b> {human_bytes(file_size)}"
         )
         await client.send_message(chat_id=LOG_CHANNEL_ID, text=log_text)
