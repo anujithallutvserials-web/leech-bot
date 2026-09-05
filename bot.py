@@ -1,6 +1,7 @@
 import os
 import time
 import logging
+import asyncio
 import aiohttp
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -45,10 +46,17 @@ def human_bytes(size):
         i += 1
     return f"{size:.2f} {units[i]}"
 
-# 0. /start Command
+# 0. /start Command with Admin Contact Button
 @app.on_message(filters.command("start") & filters.chat(ALLOWED_GROUP_ID))
 async def start_handler(client: Client, message: Message):
-    await message.reply_text("🤖 Hello! I am Leech Bot. Ready to help you download and manage files!")
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 Admin Contact", url="https://t.me/anujith1238")]
+    ])
+    await message.reply_text(
+        "🤖 **I am Leech Bot!**\n"
+        "Ready to help you download and manage files.",
+        reply_markup=keyboard
+    )
 
 # 1. /usetting Command
 @app.on_message(filters.command("usetting") & filters.chat(ALLOWED_GROUP_ID))
@@ -231,7 +239,11 @@ async def leech_handler(client: Client, message: Message):
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
 
-if __name__ == "__main__":
+async def main():
+    await start_web_server()
+    await app.start()
     print("🤖 Leech Bot Started Successfully...")
-    app.loop.run_until_complete(start_web_server())
-    app.run()
+    await asyncio.gather(*(asyncio.Event().wait() for _ in range(1)))
+
+if __name__ == "__main__":
+    app.loop.run_until_complete(main())
