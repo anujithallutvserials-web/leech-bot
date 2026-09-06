@@ -411,14 +411,12 @@ async def process_download(client, status_msg, user_id, user_name, url, quality,
                 'format': f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best',
             }
 
-        # Run yt-dlp inside executor to handle cancellation properly
         loop = asyncio.get_running_loop()
         def run_ytdl():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info_dict = ydl.extract_info(url, download=True)
                 return ydl.prepare_filename(info_dict), info_dict
 
-        # Check cancel before starting
         if user_id in CANCEL_REQUESTS:
             raise Exception("Task cancelled by user/admin.")
 
@@ -489,4 +487,5 @@ async def process_download(client, status_msg, user_id, user_name, url, quality,
                 client.send_document(chat_id=DATABASE_CHANNEL_ID, document=file_path, caption=caption, thumb=valid_thumb)
             )
         else:
-       
+            await asyncio.gather(
+                client.send_video(chat_id=status_msg.chat.id, video=file_path, ca
