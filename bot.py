@@ -24,6 +24,7 @@ ADMIN_ID = 1727225499
 app = Client("LeechBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 USER_THUMBNAILS = {}
+USER_FILE_MODES = {}  # user_id: "video" or "document"
 WAITING_FOR_THUMB = set()
 USER_YTDL_LINKS = {}
 
@@ -89,6 +90,19 @@ def generate_thumbnail(video_path, user_id):
         logging.error(f"Error generating thumbnail: {e}")
     return None
 
+async def download_image_from_url(url, save_path):
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    with open(save_path, "wb") as f:
+                        f.write(data)
+                    return True
+    except Exception as e:
+        logging.error(f"Failed to download thumbnail from URL: {e}")
+    return False
+
 @app.on_message(filters.command("start"))
 async def start_handler(client: Client, message: Message):
     user = message.from_user
@@ -117,15 +131,18 @@ async def start_handler(client: Client, message: Message):
 async def usetting_handler(client: Client, message: Message):
     user_id = message.from_user.id
     has_thumb = "Yes 🖼️" if user_id in USER_THUMBNAILS and USER_THUMBNAILS[user_id] else "No ❌"
+    current_mode = USER_FILE_MODES.get(user_id, "video")
+    mode_text = "📹 Video Format" if current_mode == "video" else "📁 Document Format"
     
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"Thumbnail Set: {has_thumb}", callback_data="set_thumb")],
+        [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_mode")],
         [InlineKeyboardButton("🗑️ Remove Thumbnail", callback_data="remove_thumb")]
     ])
     
     await message.reply_text(
         "⚙️ **User Personal Settings**\n\n"
-        "Configure your personal thumbnail here:",
+        "Configure your personal thumbnail and upload format here:",
         reply_markup=keyboard
     )
 
@@ -140,6 +157,22 @@ async def callback_handler(client: Client, callback_query: CallbackQuery):
             "🖼️ Please send your thumbnail photo (Image) to this group.\n"
             "The bot will automatically save it as your default thumbnail!"
         )
+    elif data == "toggle_mode":
+        current_mode = USER_FILE_MODES.get(user_id, "video")
+        new_mode = "document" if current_mode == "video" else "video"
+        USER_FILE_MODES[user_id] = new_mode
+        
+        has_thumb = "Yes 🖼️" if user_id in USER_THUMBNAILS and USER_THUMBNAILS[user_id] else "No ❌"
+        mode_text = "📹 Video Format" if new_mode == "video" else "📁 Document Format"
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"Thumbnail Set: {has_thumb}", callback_data="set_thumb")],
+            [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_mode")],
+            [InlineKeyboardButton("🗑️ Remove Thumbnail", callback_data="remove_thumb")]
+        ])
+        await callback_query.message.edit_reply_markup(reply_markup=keyboard)
+        await callback_query.answer(f"Format updated to {new_mode}!")
+
     elif data == "remove_thumb":
         if user_id in USER_THUMBNAILS:
             if os.path.exists(USER_THUMBNAILS[user_id]):
@@ -154,7 +187,7 @@ async def callback_handler(client: Client, callback_query: CallbackQuery):
         task_user_id = int(data.split("_")[2])
         if user_id == task_user_id or user_id == ADMIN_ID:
             CANCEL_REQUESTS.add(task_user_id)
-            await callback_query.answer("⚠️ Task Cancel requested... Please wait.", show_alert=True)
+            await callback_query.answer("⚠️ Task cancellation requested. Stopping task...", show_alert=True)
         else:
             await callback_query.answer("❌ You are not authorized to cancel this task!", show_alert=True)
 
@@ -233,10 +266,30 @@ async def bypass_handler(client: Client, message: Message):
 @app.on_message(filters.command("leech") & filters.chat(ALLOWED_GROUP_ID))
 async def leech_handler(client: Client, message: Message):
     if len(message.command) < 2:
-        await message.reply_text("❌ Please provide a link!\nExample: `/leech https://link.com`")
+        await message.reply_text("❌ Please provide a link!\nExample: `/leech https://link.com -n NewName -thumb https://image.url`")
         return
 
-    url = message.command[1]
+    raw_text = message.text.split(" ", 1)[1]
+    
+    url = raw_text
+    custom_name = None
+    custom_thumb_url = None
+    
+    if "-thumb" in raw_text:
+        parts = raw_text.split("-thumb")
+        url = parts[0].strip()
+        custom_thumb_url = parts[1].strip().split(" ")[0]
+        if "-n" in parts[0]:
+            sub_parts = parts[0].split("-n")
+            url = sub_parts[0].strip()
+            custom_name = sub_parts[1].strip()
+    elif "-n" in raw_text:
+        parts = raw_text.split("-n")
+        url = parts[0].strip()
+        custom_name = parts[1].strip().split(" -thumb")[0]
+        if "-thumb" in parts[1]:
+            custom_thumb_url = parts[1].split("-thumb")[1].strip()
+
     user = message.from_user
     user_name = user.first_name if user else "Unknown"
     user_id = user.id if user else 0
@@ -252,7 +305,7 @@ async def leech_handler(client: Client, message: Message):
             return
 
     status_msg = await message.reply_text("⏳ Initializing download... Please wait.")
-    await process_download(client, status_msg, user_id, user_name, url, 'best')
+    await process_download(client, status_msg, user_id, user_name, url, 'best', custom_name, custom_thumb_url)
 
 @app.on_message((filters.command("ytdl") | filters.command("yt")) & filters.chat(ALLOWED_GROUP_ID))
 async def ytdl_handler(client: Client, message: Message):
@@ -275,17 +328,20 @@ async def ytdl_handler(client: Client, message: Message):
     ])
 
     await message.reply_text(
-        "👇 **Select video formatni tanlang:**",
+        "👇 **Select video format quality:**",
         reply_markup=keyboard
     )
 
-async def process_download(client, status_msg, user_id, user_name, url, quality):
+async def process_download(client, status_msg, user_id, user_name, url, quality, custom_name=None, custom_thumb_url=None):
     ACTIVE_TASKS[user_id] = ACTIVE_TASKS.get(user_id, 0) + 1
     
     file_path = None
     auto_thumb_path = None
+    temp_custom_thumb = None
+    
     try:
         os.makedirs("downloads", exist_ok=True)
+        os.makedirs("thumbnails", exist_ok=True)
         last_update_time = 0
 
         cancel_keyboard = InlineKeyboardMarkup([
@@ -355,21 +411,40 @@ async def process_download(client, status_msg, user_id, user_name, url, quality)
                 'format': f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best',
             }
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info_dict = ydl.extract_info(url, download=True)
-            file_path = ydl.prepare_filename(info_dict)
-            if quality == 'mp3':
-                file_path = os.path.splitext(file_path)[0] + ".mp3"
-            file_title = info_dict.get('title', 'Media')
-            file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+        # Run yt-dlp inside executor to handle cancellation properly
+        loop = asyncio.get_running_loop()
+        def run_ytdl():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info_dict = ydl.extract_info(url, download=True)
+                return ydl.prepare_filename(info_dict), info_dict
+
+        # Check cancel before starting
+        if user_id in CANCEL_REQUESTS:
+            raise Exception("Task cancelled by user/admin.")
+
+        file_path, info_dict = await loop.run_in_executor(None, run_ytdl)
+        
+        if quality == 'mp3':
+            file_path = os.path.splitext(file_path)[0] + ".mp3"
+        file_title = info_dict.get('title', 'Media')
+        
+        if custom_name and file_path and os.path.exists(file_path):
+            ext = os.path.splitext(file_path)[1]
+            new_file_path = os.path.join("downloads", f"{custom_name}{ext}")
+            os.rename(file_path, new_file_path)
+            file_path = new_file_path
+            file_title = custom_name
+
+        file_size = os.path.getsize(file_path) if file_path and os.path.exists(file_path) else 0
 
         if user_id in CANCEL_REQUESTS:
             raise Exception("Task cancelled by user/admin.")
 
         await status_msg.edit_text(
-            f"📤 **Uploading to Telegram...**\n\n" \
+            f"📤 **Uploading...**\n\n" \
             f"📁 **Name:** `{file_title}`\n" \
-            f"📦 **Size:** `{human_bytes(file_size)}`"
+            f"📦 **Size:** `{human_bytes(file_size)}`",
+            reply_markup=cancel_keyboard
         )
 
         caption = (
@@ -379,8 +454,16 @@ async def process_download(client, status_msg, user_id, user_name, url, quality)
             f"🔗 <b>Link:</b> {url}"
         )
 
-        thumb = USER_THUMBNAILS.get(user_id)
-        valid_thumb = thumb if thumb and os.path.exists(thumb) else None
+        valid_thumb = None
+        if custom_thumb_url:
+            temp_custom_thumb = f"thumbnails/custom_{user_id}.jpg"
+            success = await download_image_from_url(custom_thumb_url, temp_custom_thumb)
+            if success and os.path.exists(temp_custom_thumb):
+                valid_thumb = temp_custom_thumb
+
+        if not valid_thumb:
+            thumb = USER_THUMBNAILS.get(user_id, None)
+            valid_thumb = thumb if thumb and os.path.exists(thumb) else None
 
         if not valid_thumb and quality != 'mp3' and file_path:
             auto_thumb_path = generate_thumbnail(file_path, user_id)
@@ -390,78 +473,20 @@ async def process_download(client, status_msg, user_id, user_name, url, quality)
         if quality != 'mp3' and file_path and os.path.exists(file_path):
             duration, width, height = get_video_info(file_path)
 
+        if user_id in CANCEL_REQUESTS:
+            raise Exception("Task cancelled by user/admin.")
+
+        file_mode = USER_FILE_MODES.get(user_id, "video")
+
         if quality == 'mp3':
-            sent_group_msg = await client.send_audio(
-                chat_id=status_msg.chat.id,
-                audio=file_path,
-                caption=caption,
-                thumb=valid_thumb,
-                reply_to_message_id=status_msg.reply_to_message_id
+            await asyncio.gather(
+                client.send_audio(chat_id=status_msg.chat.id, audio=file_path, caption=caption, thumb=valid_thumb, reply_to_message_id=status_msg.reply_to_message_id),
+                client.send_audio(chat_id=DATABASE_CHANNEL_ID, audio=file_path, caption=caption, thumb=valid_thumb)
+            )
+        elif file_mode == "document":
+            await asyncio.gather(
+                client.send_document(chat_id=status_msg.chat.id, document=file_path, caption=caption, thumb=valid_thumb, reply_to_message_id=status_msg.reply_to_message_id),
+                client.send_document(chat_id=DATABASE_CHANNEL_ID, document=file_path, caption=caption, thumb=valid_thumb)
             )
         else:
-            sent_group_msg = await client.send_video(
-                chat_id=status_msg.chat.id,
-                video=file_path,
-                caption=caption,
-                duration=duration,
-                width=width,
-                height=height,
-                thumb=valid_thumb,
-                reply_to_message_id=status_msg.reply_to_message_id
-            )
-
-        db_info_text = (
-            f"👤 <b>User Name:</b> {user_name}\n" \
-            f"🆔 <b>User ID:</b> <code>{user_id}</code>\n" \
-            f"🔗 <b>Download URL:</b> {url}\n" \
-            f"📁 <b>File Name:</b> {file_title}\n" \
-            f"📦 <b>File Size:</b> {human_bytes(file_size)}"
-        )
-        try:
-            await client.send_message(chat_id=DATABASE_CHANNEL_ID, text=db_info_text)
-            await sent_group_msg.copy(chat_id=DATABASE_CHANNEL_ID)
-        except Exception as e:
-            logging.error(f"Failed to send/copy to DATABASE_CHANNEL: {e}")
-
-        log_text = (
-            f"📥 <b>New Download Completed!</b>\n\n" \
-            f"👤 <b>User:</b> {user_name} (`{user_id}`)\n" \
-            f"🔗 <b>URL:</b> {url}\n" \
-            f"📁 <b>File:</b> {file_title}\n" \
-            f"📦 <b>Size:</b> {human_bytes(file_size)}"
-        )
-        try:
-            await client.send_message(chat_id=LOG_CHANNEL_ID, text=log_text)
-        except Exception as e:
-            logging.error(f"Failed to send log to LOG_CHANNEL: {e}")
-
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
-        if auto_thumb_path and os.path.exists(auto_thumb_path):
-            os.remove(auto_thumb_path)
-            
-        await status_msg.delete()
-
-    except Exception as e:
-        await status_msg.edit_text(f"❌ **Task Cancelled / Failed!**\n\n**Reason:** `{str(e)}`")
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
-        if auto_thumb_path and os.path.exists(auto_thumb_path):
-            os.remove(auto_thumb_path)
-            
-    finally:
-        if user_id in CANCEL_REQUESTS:
-            CANCEL_REQUESTS.remove(user_id)
-        if user_id in ACTIVE_TASKS:
-            ACTIVE_TASKS[user_id] -= 1
-            if ACTIVE_TASKS[user_id] <= 0:
-                del ACTIVE_TASKS[user_id]
-
-async def main():
-    await start_web_server()
-    await app.start()
-    print("🤖 Leech Bot Started Successfully...")
-    await asyncio.gather(*(asyncio.Event().wait() for _ in range(1)))
-
-if __name__ == "__main__":
-    app.loop.run_until_complete(main())
+       
