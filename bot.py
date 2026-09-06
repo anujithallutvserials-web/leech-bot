@@ -26,6 +26,7 @@ app = Client("LeechBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 USER_THUMBNAILS = {}
 WAITING_FOR_THUMB = set()
 USER_YTDL_LINKS = {}
+USER_FILE_MODES = {} # User file format modes (video / document)
 
 ACTIVE_TASKS = {}
 USER_TASK_LIMIT = 2
@@ -89,15 +90,22 @@ def generate_thumbnail(video_path, user_id):
         logging.error(f"Error generating thumbnail: {e}")
     return None
 
-@app.on_message(filters.command("start"))
+# ==============================================================================
+# 1. പുതിയ യൂസർ ബോട്ട് സ്റ്റാർട്ട് ചെയ്യുമ്പോൾ ലോഗ് ചാനലിലേക്ക് അയക്കുന്ന കോഡ്
+# ==============================================================================
+@app.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
     user = message.from_user
+    user_id = user.id if user else 0
+    user_name = user.first_name if user else "Unknown"
+    username = f"@{user.username}" if user and user.username else "No Username"
+
     if user and not user.is_bot:
         log_msg = (
             f"👤 <b>New User Started Bot!</b>\n\n"
-            f"<b>Name:</b> {user.first_name}\n"
-            f"<b>User ID:</b> <code>{user.id}</code>\n"
-            f"<b>Username:</b> @{user.username if user.username else 'None'}"
+            f"<b>Name:</b> {user_name}\n"
+            f"<b>User ID:</b> <code>{user_id}</code>\n"
+            f"<b>Username:</b> {username}"
         )
         try:
             await client.send_message(chat_id=LOG_CHANNEL_ID, text=log_msg)
@@ -117,15 +125,18 @@ async def start_handler(client: Client, message: Message):
 async def usetting_handler(client: Client, message: Message):
     user_id = message.from_user.id
     has_thumb = "Yes 🖼️" if user_id in USER_THUMBNAILS and USER_THUMBNAILS[user_id] else "No ❌"
+    current_mode = USER_FILE_MODES.get(user_id, "video")
+    mode_text = "📹 Video Format" if current_mode == "video" else "📁 Document Format"
     
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"Thumbnail Set: {has_thumb}", callback_data="set_thumb")],
+        [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_mode")],
         [InlineKeyboardButton("🗑️ Remove Thumbnail", callback_data="remove_thumb")]
     ])
     
     await message.reply_text(
         "⚙️ **User Personal Settings**\n\n"
-        "Configure your personal thumbnail here:",
+        "Configure your personal thumbnail and upload format here:",
         reply_markup=keyboard
     )
 
@@ -142,14 +153,32 @@ async def callback_handler(client: Client, callback_query: CallbackQuery):
         )
     elif data == "remove_thumb":
         if user_id in USER_THUMBNAILS:
-            if os.path.exists(USER_THUMBNAILS[user_id]):
-                os.remove(USER_THUMBNAILS[user_id])
+            if USER_THUMBNAILS[user_id] and os.path.exists(USER_THUMBNAILS[user_id]):
+                try:
+                    os.remove(USER_THUMBNAILS[user_id])
+                except:
+                    pass
             del USER_THUMBNAILS[user_id]
         if user_id in WAITING_FOR_THUMB:
             WAITING_FOR_THUMB.remove(user_id)
             
         await callback_query.message.edit_text("🗑️ Your thumbnail has been successfully removed!")
     
+    elif data == "toggle_mode":
+        current_mode = USER_FILE_MODES.get(user_id, "video")
+        new_mode = "document" if current_mode == "video" else "video"
+        USER_FILE_MODES[user_id] = new_mode
+        mode_text = "📹 Video Format" if new_mode == "video" else "📁 Document Format"
+        
+        has_thumb = "Yes 🖼️" if user_id in USER_THUMBNAILS and USER_THUMBNAILS[user_id] else "No ❌"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"Thumbnail Set: {has_thumb}", callback_data="set_thumb")],
+            [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_mode")],
+            [InlineKeyboardButton("🗑️ Remove Thumbnail", callback_data="remove_thumb")]
+        ])
+        await callback_query.message.edit_reply_markup(reply_markup=keyboard)
+        await callback_query.answer(f"Changed upload mode to {new_mode}!")
+
     elif data.startswith("cancel_dl_"):
         task_user_id = int(data.split("_")[2])
         if user_id == task_user_id or user_id == ADMIN_ID:
@@ -176,7 +205,7 @@ async def callback_handler(client: Client, callback_query: CallbackQuery):
                 return
 
         await callback_query.message.edit_text("⏳ Initializing download with selected quality... Please wait.")
-        await process_download(client, callback_query.message, user_id, callback_query.from_user.first_name, url, format_code)
+        await process_download(client, callback_query.message, user_id, callback_query.from_user.first_name, url, None, None, format_code)
 
 @app.on_message(filters.photo & filters.chat(ALLOWED_GROUP_ID))
 async def save_thumbnail(client: Client, message: Message):
@@ -230,13 +259,35 @@ async def bypass_handler(client: Client, message: Message):
     except Exception as e:
         await msg.edit_text(f"❌ Failed to bypass link!\n\n**Reason:** `{str(e)}`")
 
+# ==============================================================================
+# 2. കസ്റ്റം നെയിം (-n) & കസ്റ്റം തമ്പ്ലൈൻ (-thumb) സപ്പോർട്ട് ചെയ്യുന്ന /leech കമാൻഡ്
+# ==============================================================================
 @app.on_message(filters.command("leech") & filters.chat(ALLOWED_GROUP_ID))
 async def leech_handler(client: Client, message: Message):
     if len(message.command) < 2:
-        await message.reply_text("❌ Please provide a link!\nExample: `/leech https://link.com`")
+        await message.reply_text("❌ Please provide a link!\nExample: `/leech https://link.com -n NewName -thumb https://image.url`")
         return
 
-    url = message.command[1]
+    raw_text = message.text.split(" ", 1)[1]
+    url = raw_text
+    custom_name = None
+    custom_thumb_url = None
+    
+    if "-thumb" in raw_text:
+        parts = raw_text.split("-thumb")
+        url = parts[0].strip()
+        custom_thumb_url = parts[1].strip().split(" ")[0]
+        if "-n" in parts[0]:
+            sub_parts = parts[0].split("-n")
+            url = sub_parts[0].strip()
+            custom_name = sub_parts[1].strip()
+    elif "-n" in raw_text:
+        parts = raw_text.split("-n")
+        url = parts[0].strip()
+        custom_name = parts[1].strip().split(" -thumb")[0]
+        if "-thumb" in parts[1]:
+            custom_thumb_url = parts[1].split("-thumb")[1].strip()
+
     user = message.from_user
     user_name = user.first_name if user else "Unknown"
     user_id = user.id if user else 0
@@ -252,7 +303,7 @@ async def leech_handler(client: Client, message: Message):
             return
 
     status_msg = await message.reply_text("⏳ Initializing download... Please wait.")
-    await process_download(client, status_msg, user_id, user_name, url, 'best')
+    await process_download(client, status_msg, user_id, user_name, url, custom_name, custom_thumb_url, 'best')
 
 @app.on_message((filters.command("ytdl") | filters.command("yt")) & filters.chat(ALLOWED_GROUP_ID))
 async def ytdl_handler(client: Client, message: Message):
@@ -279,11 +330,16 @@ async def ytdl_handler(client: Client, message: Message):
         reply_markup=keyboard
     )
 
-async def process_download(client, status_msg, user_id, user_name, url, quality):
+# ==============================================================================
+# 3 & 4. ഡൗൺലോഡ് പ്രോസസ്സ്, ഒരേസമയം ഗ്രൂപ്പിലേക്കും ചാനലിലേക്കും അയക്കൽ, ലോഗിംഗ്
+# ==============================================================================
+async def process_download(client, status_msg, user_id, user_name, url, custom_name, custom_thumb_url, quality):
     ACTIVE_TASKS[user_id] = ACTIVE_TASKS.get(user_id, 0) + 1
     
     file_path = None
     auto_thumb_path = None
+    custom_thumb_path = None
+    
     try:
         os.makedirs("downloads", exist_ok=True)
         last_update_time = 0
@@ -360,7 +416,20 @@ async def process_download(client, status_msg, user_id, user_name, url, quality)
             file_path = ydl.prepare_filename(info_dict)
             if quality == 'mp3':
                 file_path = os.path.splitext(file_path)[0] + ".mp3"
-            file_title = info_dict.get('title', 'Media')
+            
+            original_title = info_dict.get('title', 'Media')
+            ext = os.path.splitext(file_path)[1]
+            
+            # കസ്റ്റം നെയിം ബാധകമാക്കൽ
+            if custom_name:
+                file_title = custom_name if custom_name.endswith(ext) else custom_name + ext
+                new_file_path = os.path.join("downloads", file_title)
+                if os.path.exists(file_path):
+                    os.rename(file_path, new_file_path)
+                    file_path = new_file_path
+            else:
+                file_title = original_title + ext if not original_title.endswith(ext) else original_title
+
             file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
 
         if user_id in CANCEL_REQUESTS:
@@ -379,8 +448,25 @@ async def process_download(client, status_msg, user_id, user_name, url, quality)
             f"🔗 <b>Link:</b> {url}"
         )
 
-        thumb = USER_THUMBNAILS.get(user_id)
-        valid_thumb = thumb if thumb and os.path.exists(thumb) else None
+        # തമ്പ്ലൈൻ സജ്ജീകരിക്കൽ (Custom URL ഉണ്ടെങ്കിൽ അത് ഡൗൺലോഡ് ചെയ്യും അല്ലെങ്കിൽ യൂസർ സെറ്റ് ചെയ്തത് എടുക്കും)
+        valid_thumb = None
+        if custom_thumb_url:
+            try:
+                os.makedirs("thumbnails", exist_ok=True)
+                custom_thumb_path = f"thumbnails/custom_{user_id}.jpg"
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(custom_thumb_url) as resp:
+                        if resp.status == 200:
+                            with open(custom_thumb_path, "wb") as f:
+                                f.write(await resp.read())
+                            if os.path.exists(custom_thumb_path) and os.path.getsize(custom_thumb_path) > 0:
+                                valid_thumb = custom_thumb_path
+            except Exception as e:
+                logging.error(f"Failed to download custom thumbnail: {e}")
+
+        if not valid_thumb:
+            thumb = USER_THUMBNAILS.get(user_id)
+            valid_thumb = thumb if thumb and os.path.exists(thumb) else None
 
         if not valid_thumb and quality != 'mp3' and file_path:
             auto_thumb_path = generate_thumbnail(file_path, user_id)
@@ -390,39 +476,49 @@ async def process_download(client, status_msg, user_id, user_name, url, quality)
         if quality != 'mp3' and file_path and os.path.exists(file_path):
             duration, width, height = get_video_info(file_path)
 
-        if quality == 'mp3':
-            sent_group_msg = await client.send_audio(
-                chat_id=status_msg.chat.id,
-                audio=file_path,
-                caption=caption,
-                thumb=valid_thumb,
-                reply_to_message_id=status_msg.reply_to_message_id
+        file_mode = USER_FILE_MODES.get(user_id, "video")
+
+        # ഗ്രൂപ്പിലേക്കും ഡാറ്റാബേസ് ചാനലിലേക്കും ഒരേസമയം അയക്കൽ (asyncio.gather ഉപയോഗിച്ച്)
+        if quality == 'mp3' or file_mode == "document":
+            await asyncio.gather(
+                client.send_document(
+                    chat_id=status_msg.chat.id,
+                    document=file_path,
+                    caption=caption,
+                    thumb=valid_thumb,
+                    reply_to_message_id=status_msg.reply_to_message_id
+                ),
+                client.send_document(
+                    chat_id=DATABASE_CHANNEL_ID,
+                    document=file_path,
+                    caption=caption,
+                    thumb=valid_thumb
+                )
             )
         else:
-            sent_group_msg = await client.send_video(
-                chat_id=status_msg.chat.id,
-                video=file_path,
-                caption=caption,
-                duration=duration,
-                width=width,
-                height=height,
-                thumb=valid_thumb,
-                reply_to_message_id=status_msg.reply_to_message_id
+            await asyncio.gather(
+                client.send_video(
+                    chat_id=status_msg.chat.id,
+                    video=file_path,
+                    caption=caption,
+                    duration=duration,
+                    width=width,
+                    height=height,
+                    thumb=valid_thumb,
+                    reply_to_message_id=status_msg.reply_to_message_id
+                ),
+                client.send_video(
+                    chat_id=DATABASE_CHANNEL_ID,
+                    video=file_path,
+                    caption=caption,
+                    duration=duration,
+                    width=width,
+                    height=height,
+                    thumb=valid_thumb
+                )
             )
 
-        db_info_text = (
-            f"👤 <b>User Name:</b> {user_name}\n" \
-            f"🆔 <b>User ID:</b> <code>{user_id}</code>\n" \
-            f"🔗 <b>Download URL:</b> {url}\n" \
-            f"📁 <b>File Name:</b> {file_title}\n" \
-            f"📦 <b>File Size:</b> {human_bytes(file_size)}"
-        )
-        try:
-            await client.send_message(chat_id=DATABASE_CHANNEL_ID, text=db_info_text)
-            await sent_group_msg.copy(chat_id=DATABASE_CHANNEL_ID)
-        except Exception as e:
-            logging.error(f"Failed to send/copy to DATABASE_CHANNEL: {e}")
-
+        # വിജയ വിവരങ്ങൾ ലോഗ് ചാനലിലേക്ക് അയക്കുന്നു
         log_text = (
             f"📥 <b>New Download Completed!</b>\n\n" \
             f"👤 <b>User:</b> {user_name} (`{user_id}`)\n" \
@@ -435,19 +531,40 @@ async def process_download(client, status_msg, user_id, user_name, url, quality)
         except Exception as e:
             logging.error(f"Failed to send log to LOG_CHANNEL: {e}")
 
+        # ഫയലുകൾ ക്ലീൻ ചെയ്യൽ
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
         if auto_thumb_path and os.path.exists(auto_thumb_path):
             os.remove(auto_thumb_path)
+        if custom_thumb_path and os.path.exists(custom_thumb_path):
+            os.remove(custom_thumb_path)
             
         await status_msg.delete()
 
     except Exception as e:
-        await status_msg.edit_text(f"❌ **Task Cancelled / Failed!**\n\n**Reason:** `{str(e)}`")
+        # ഡൗൺലോഡ് സമയത്ത് എറർ വന്നാൽ ലോഗ് ചാനലിലേക്ക് അയക്കുന്നു
+        error_msg = (
+            f"⚠️ <b>Download Failed / Error Occurred!</b>\n\n"
+            f"<b>User:</b> {user_name} (`{user_id}`)\n"
+            f"<b>URL:</b> `{url}`\n"
+            f"<b>Error Details:</b> `{str(e)}`"
+        )
+        try:
+            await client.send_message(chat_id=LOG_CHANNEL_ID, text=error_msg)
+        except Exception:
+            pass
+        
+        try:
+            await status_msg.edit_text(f"❌ **Task Cancelled / Failed!**\n\n**Reason:** `{str(e)}`")
+        except Exception:
+            pass
+
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
         if auto_thumb_path and os.path.exists(auto_thumb_path):
             os.remove(auto_thumb_path)
+        if custom_thumb_path and os.path.exists(custom_thumb_path):
+            os.remove(custom_thumb_path)
             
     finally:
         if user_id in CANCEL_REQUESTS:
