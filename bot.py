@@ -4,7 +4,7 @@ import logging
 import asyncio
 import aiohttp
 import subprocess
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 import yt_dlp
 from aiohttp import web
@@ -488,4 +488,54 @@ async def process_download(client, status_msg, user_id, user_name, url, quality,
             )
         else:
             await asyncio.gather(
-                client.send_video(chat_id=status_msg.chat.id, video=file_path, ca
+                client.send_video(chat_id=status_msg.chat.id, video=file_path, caption=caption, duration=duration, width=width, height=height, thumb=valid_thumb, reply_to_message_id=status_msg.reply_to_message_id),
+                client.send_video(chat_id=DATABASE_CHANNEL_ID, video=file_path, caption=caption, duration=duration, width=width, height=height, thumb=valid_thumb)
+            )
+
+        log_text = (
+            f"📥 <b>New Download Completed!</b>\n"
+            f"<b>File Name:</b> {file_title}\n"
+            f"<b>User:</b> {user_name} (`{user_id}`)"
+        )
+        try:
+            await client.send_message(chat_id=LOG_CHANNEL_ID, text=log_text)
+        except Exception:
+            pass
+
+    except Exception as e:
+        err_msg = str(e)
+        if "cancelled" in err_msg.lower():
+            await status_msg.edit_text("❌ **Task successfully cancelled!**")
+        else:
+            await status_msg.edit_text(f"❌ **Download/Upload Failed!**\n\n**Reason:** `{err_msg}`")
+    
+    finally:
+        if user_id in CANCEL_REQUESTS:
+            CANCEL_REQUESTS.remove(user_id)
+        if user_id in ACTIVE_TASKS:
+            ACTIVE_TASKS[user_id] = max(0, ACTIVE_TASKS[user_id] - 1)
+        
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except:
+                pass
+        if auto_thumb_path and os.path.exists(auto_thumb_path):
+            try:
+                os.remove(auto_thumb_path)
+            except:
+                pass
+        if temp_custom_thumb and os.path.exists(temp_custom_thumb):
+            try:
+                os.remove(temp_custom_thumb)
+            except:
+                pass
+
+async def main():
+    await start_web_server()
+    await app.start()
+    logging.info("Bot Started Successfully! 🚀")
+    await idle()
+
+if __name__ == "__main__":
+    asyncio.run(main())
