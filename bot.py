@@ -4,6 +4,7 @@ import logging
 import asyncio
 import aiohttp
 import subprocess
+import libtorrent as lt
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 import yt_dlp
@@ -146,7 +147,7 @@ async def start_handler(client: Client, message: Message):
     ])
     await message.reply_text(
         "🤖 **I am Leech Bot!**\n"
-        "Ready to help you download and manage files.",
+        "Ready to help you download and manage files (Telegram, YouTube, GoFile & Magnet Links).",
         reply_markup=keyboard
     )
 
@@ -291,7 +292,7 @@ async def bypass_handler(client: Client, message: Message):
 @app.on_message(filters.command("leech") & filters.chat(ALLOWED_GROUP_ID))
 async def leech_handler(client: Client, message: Message):
     if len(message.command) < 2:
-        await message.reply_text("❌ Please provide a link!\nExample: `/leech https://t.me/channel/123 -n NewName -t ThumbnailURL`")
+        await message.reply_text("❌ Please provide a link or magnet link!\nExample: `/leech magnet:?xt=urn:btih:...`")
         return
 
     raw_text = message.text.split(" ", 1)[1]
@@ -330,7 +331,9 @@ async def leech_handler(client: Client, message: Message):
 
     status_msg = await message.reply_text("⏳ Initializing download... Please wait.")
     
-    if "t.me/" in url and not "http" in url.split("t.me/")[1] and len(url.split("t.me/")[1].split("/")) >= 2:
+    if url.startswith("magnet:?xt="):
+        await process_magnet_link(client, status_msg, user_id, user_name, url)
+    elif "t.me/" in url and not "http" in url.split("t.me/")[1] and len(url.split("t.me/")[1].split("/")) >= 2:
         await process_telegram_link(client, status_msg, user_id, user_name, url, custom_name, custom_thumb_source)
     else:
         await process_download(client, status_msg, user_id, user_name, url, custom_name, custom_thumb_source, 'best')
@@ -356,9 +359,107 @@ async def ytdl_handler(client: Client, message: Message):
     ])
 
     await message.reply_text(
-        "👇 **Select video formatni tanlang:**",
+        "👇 **Select video format:**",
         reply_markup=keyboard
     )
+
+async def process_magnet_link(client, status_msg, user_id, user_name, magnet_link):
+    ACTIVE_TASKS[user_id] = ACTIVE_TASKS.get(user_id, 0) + 1
+    save_path = "downloads"
+    os.makedirs(save_path, exist_ok=True)
+    
+    ses = lt.session()
+    ses.listen_port(6881, 6891)
+    
+    params = {
+        'save_path': save_path,
+        'storage_mode': lt.storage_mode_t.storage_mode_sparse
+    }
+    
+    try:
+        await status_msg.edit_text("🧲 **Magnet Link detected!** Adding to torrent session...")
+        handle = lt.add_magnet_uri(ses, magnet_link, params)
+        
+        await status_msg.edit_text("⏳ Fetching torrent metadata from peers...")
+        while not handle.has_metadata():
+            if user_id in CANCEL_REQUESTS:
+                raise Exception("Task cancelled by user.")
+            await asyncio.sleep(1)
+            
+        torrent_name = handle.name()
+        await status_msg.edit_text(f"📥 **Starting Torrent Download:**\n`{torrent_name}`")
+        
+        while handle.status().state != lt.torrent_status.seeding:
+            if user_id in CANCEL_REQUESTS:
+                raise Exception("Task cancelled by user.")
+                
+            s = handle.status()
+            percentage = s.progress * 100
+            bar = get_progress_bar(percentage)
+            
+            progress_str = (
+                f"🧲 **Downloading Magnet...**\n"
+                f"📁 <code>{torrent_name}</code>\n\n"
+                f"{bar} {percentage:.1f}%\n"
+                f" ┣ 💾 **Size:** {human_bytes(s.total_wanted)}\n"
+                f" ┣ ⚡ **Speed:** {human_bytes(s.download_rate)}/s\n"
+                f" ┗ 👥 **Peers:** {s.num_peers}"
+            )
+            
+            try:
+                await status_msg.edit_text(
+                    progress_str,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✖️ Task Cancel", callback_data=f"cancel_dl_{user_id}")]
+                    ])
+                )
+            except Exception:
+                pass
+                
+            await asyncio.sleep(3)
+            
+        downloaded_file_path = os.path.join(save_path, torrent_name)
+        if not os.path.exists(downloaded_file_path):
+            raise Exception("Downloaded torrent path not found.")
+
+        file_size = os.path.getsize(downloaded_file_path) if os.path.isfile(downloaded_file_path) else sum(os.path.getpath(os.path.join(path, f)) for path, _, files in os.walk(downloaded_file_path) for f in files)
+
+        caption = (
+            f"<b>{torrent_name}</b>\n\n"
+            f"👤 <b>Task By:</b> {user_name} (`{user_id}`)\n"
+            f"📦 <b>Size:</b> {human_bytes(file_size)}\n"
+            f"🔗 <b>Type:</b> Magnet Torrent"
+        )
+
+        await status_msg.edit_text("📤 Uploading torrent file to Telegram...")
+        
+        if os.path.isfile(downloaded_file_path):
+            sent_msg = await client.send_document(
+                chat_id=status_msg.chat.id,
+                document=downloaded_file_path,
+                caption=caption
+            )
+            try:
+                if sent_msg:
+                    await sent_msg.copy(chat_id=DATABASE_CHANNEL_ID)
+            except Exception:
+                pass
+            os.remove(downloaded_file_path)
+        else:
+            # If it's a folder, send a notice or zip it (simple document dispatch here)
+            sent_msg = await client.send_message(status_msg.chat.id, f"✅ Torrent Download Completed: `{torrent_name}`")
+
+        await status_msg.delete()
+
+    except Exception as e:
+        await status_msg.edit_text(f"❌ **Magnet Task Failed!**\n\n**Reason:** `{str(e)}`")
+    finally:
+        if user_id in CANCEL_REQUESTS:
+            CANCEL_REQUESTS.remove(user_id)
+        if user_id in ACTIVE_TASKS:
+            ACTIVE_TASKS[user_id] -= 1
+            if ACTIVE_TASKS[user_id] <= 0:
+                del ACTIVE_TASKS[user_id]
 
 async def process_telegram_link(client, status_msg, user_id, user_name, url, custom_name, custom_thumb_source):
     ACTIVE_TASKS[user_id] = ACTIVE_TASKS.get(user_id, 0) + 1
@@ -458,19 +559,23 @@ async def process_telegram_link(client, status_msg, user_id, user_name, url, cus
             thumb = USER_THUMBNAILS.get(user_id)
             valid_thumb = thumb if thumb and os.path.exists(thumb) else None
 
-        duration, width, height = 0, 0, 0
+        duration, width, height = get_video_info(downloaded_file)
         if target_msg.video or target_msg.animation:
             video_obj = target_msg.video or target_msg.animation
-            duration = video_obj.duration
-            width = video_obj.width
-            height = video_obj.height
-            if not valid_thumb:
-                auto_thumb_path = generate_thumbnail(downloaded_file, user_id)
-                valid_thumb = auto_thumb_path
+            if duration == 0 and video_obj.duration:
+                duration = video_obj.duration
+            if width == 0 and video_obj.width:
+                width = video_obj.width
+            if height == 0 and video_obj.height:
+                height = video_obj.height
+
+        if not valid_thumb and duration > 0:
+            auto_thumb_path = generate_thumbnail(downloaded_file, user_id)
+            valid_thumb = auto_thumb_path
 
         file_mode = USER_FILE_MODES.get(user_id, "video")
 
-        if file_mode == "document" or not (target_msg.video or target_msg.audio):
+        if file_mode == "document":
             sent_msg = await client.send_document(
                 chat_id=status_msg.chat.id,
                 document=downloaded_file,
@@ -715,13 +820,13 @@ async def process_download(client, status_msg, user_id, user_name, url, custom_n
             thumb = USER_THUMBNAILS.get(user_id)
             valid_thumb = thumb if thumb and os.path.exists(thumb) else None
 
-        if not valid_thumb and quality != 'mp3' and file_path:
-            auto_thumb_path = generate_thumbnail(file_path, user_id)
-            valid_thumb = auto_thumb_path
-
         duration, width, height = 0, 0, 0
         if quality != 'mp3' and file_path and os.path.exists(file_path):
             duration, width, height = get_video_info(file_path)
+
+        if not valid_thumb and quality != 'mp3' and file_path and duration > 0:
+            auto_thumb_path = generate_thumbnail(file_path, user_id)
+            valid_thumb = auto_thumb_path
 
         file_mode = USER_FILE_MODES.get(user_id, "video")
 
@@ -810,6 +915,86 @@ async def main():
     await start_web_server()
     await app.start()
     print("🤖 Leech Bot Started Successfully...")
+    
+    # ==========================================
+    # ADDITIONAL HANDLERS (GoFile API & Auto Verify)
+    # ==========================================
+    
+    async def get_gofile_direct_link(url):
+        try:
+            file_id = url.split('/')[-1].split('?')[0]
+            api_url = f"https://api.gofile.io/contents/{file_id}?wt=4fd6sg3d7s"
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            async with aiohttp.ClientSession() as session:
+                async with session.get(api_url, headers=headers) as resp:
+                    if resp.status == 200:
+                        res_json = await resp.json()
+                        if res_json.get('status') == 'ok':
+                            contents = res_json['data']['contents']
+                            for _, item in contents.items():
+                                if item['type'] == 'file':
+                                    return item.get('link')
+        except Exception as e:
+            logging.error(f"GoFile Extraction Error: {e}")
+        return None
+
+    @app.on_message(filters.regex(r"https?://gofile\.io/d/\w+") & filters.chat(ALLOWED_GROUP_ID))
+    async def gofile_link_handler(client: Client, message: Message):
+        url = message.text.split()[0] if len(message.text.split()) > 0 else message.text
+        status_msg = await message.reply_text("📥 **Gofile Link Detected!** Fetching direct download link...")
+        
+        direct_link = await get_gofile_direct_link(url)
+        if direct_link:
+            user = message.from_user
+            await status_msg.edit_text("⏳ Downloading from Gofile...")
+            await process_download(client, status_msg, user.id, user.first_name, direct_link, None, None, 'best')
+        else:
+            await status_msg.edit_text("❌ Failed to fetch direct link from Gofile. Please check the link!")
+
+    @app.on_message(filters.command("verify") & filters.chat(ALLOWED_GROUP_ID))
+    async def auto_verify_handler(client: Client, message: Message):
+        if len(message.command) < 2:
+            await message.reply_text("❌ Please provide the verification URL!\nExample: `/verify <link>`")
+            return
+
+        url = message.command[1]
+        msg = await message.reply_text("🔄 Auto-verifying link through security steps...")
+
+        bypassed_link = url
+        try:
+            apis = [
+                f"https://api.easysky.in/bypass?url={url}",
+                f"https://bypass.pmh.workers.dev/?url={url}",
+                f"https://api.bypass.vip/bypass?url={url}"
+            ]
+            
+            async with aiohttp.ClientSession() as session:
+                for api in apis:
+                    try:
+                        async with session.get(api, timeout=8) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                result_url = data.get("destination") or data.get("bypassed_link") or data.get("url")
+                                if result_url and result_url != url:
+                                    bypassed_link = result_url
+                                    break
+                    except:
+                        continue
+
+            output_text = (
+                f"<b>Nick Bypass Bot (Auto-Verified)</b>\n\n"
+                f"<b>Original Link :</b> 🔗\n"
+                f"✅ <code>{url}</code>\n\n"
+                f"<b>Bypassed Link :</b> 🔓\n"
+                f"✅ <code>{bypassed_link}</code>"
+            )
+            await msg.edit_text(output_text)
+
+        except Exception as e:
+            await msg.edit_text(f"❌ Auto-verification failed!\nReason: `{str(e)}`")
+
+    # ==========================================
+    
     await idle()
 
 if __name__ == "__main__":
