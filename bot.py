@@ -356,7 +356,7 @@ async def ytdl_handler(client: Client, message: Message):
     ])
 
     await message.reply_text(
-        "👇 **Select video formatni tanlang:**",
+        "👇 **Select video format:**",
         reply_markup=keyboard
     )
 
@@ -810,6 +810,86 @@ async def main():
     await start_web_server()
     await app.start()
     print("🤖 Leech Bot Started Successfully...")
+    
+    # ==========================================
+    # ADDITIONAL HANDLERS (GoFile & Auto Verify)
+    # ==========================================
+    
+    async def get_gofile_direct_link(url):
+        try:
+            file_id = url.split('/')[-1].split('?')[0]
+            api_url = f"https://api.gofile.io/contents/{file_id}?wt=4fd6sg3d7s"
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            async with aiohttp.ClientSession() as session:
+                async with session.get(api_url, headers=headers) as resp:
+                    if resp.status == 200:
+                        res_json = await resp.json()
+                        if res_json.get('status') == 'ok':
+                            contents = res_json['data']['contents']
+                            for _, item in contents.items():
+                                if item['type'] == 'file':
+                                    return item.get('link')
+        except Exception as e:
+            logging.error(f"GoFile Extraction Error: {e}")
+        return None
+
+    @app.on_message(filters.regex(r"https?://gofile\.io/d/\w+") & filters.chat(ALLOWED_GROUP_ID))
+    async def gofile_link_handler(client: Client, message: Message):
+        url = message.text.split()[0] if len(message.text.split()) > 0 else message.text
+        status_msg = await message.reply_text("📥 **Gofile Link Detected!** Fetching direct download link...")
+        
+        direct_link = await get_gofile_direct_link(url)
+        if direct_link:
+            user = message.from_user
+            await status_msg.edit_text("⏳ Downloading from Gofile...")
+            await process_download(client, status_msg, user.id, user.first_name, direct_link, None, None, 'best')
+        else:
+            await status_msg.edit_text("❌ Failed to fetch direct link from Gofile. Please check the link!")
+
+    @app.on_message(filters.command("verify") & filters.chat(ALLOWED_GROUP_ID))
+    async def auto_verify_handler(client: Client, message: Message):
+        if len(message.command) < 2:
+            await message.reply_text("❌ Please provide the verification URL!\nExample: `/verify <link>`")
+            return
+
+        url = message.command[1]
+        msg = await message.reply_text("🔄 Auto-verifying link through security steps...")
+
+        bypassed_link = url
+        try:
+            apis = [
+                f"https://api.easysky.in/bypass?url={url}",
+                f"https://bypass.pmh.workers.dev/?url={url}",
+                f"https://api.bypass.vip/bypass?url={url}"
+            ]
+            
+            async with aiohttp.ClientSession() as session:
+                for api in apis:
+                    try:
+                        async with session.get(api, timeout=8) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                result_url = data.get("destination") or data.get("bypassed_link") or data.get("url")
+                                if result_url and result_url != url:
+                                    bypassed_link = result_url
+                                    break
+                    except:
+                        continue
+
+            output_text = (
+                f"<b>Nick Bypass Bot (Auto-Verified)</b>\n\n"
+                f"<b>Original Link :</b> 🔗\n"
+                f"✅ <code>{url}</code>\n\n"
+                f"<b>Bypassed Link :</b> 🔓\n"
+                f"✅ <code>{bypassed_link}</code>"
+            )
+            await msg.edit_text(output_text)
+
+        except Exception as e:
+            await msg.edit_text(f"❌ Auto-verification failed!\nReason: `{str(e)}`")
+
+    # ==========================================
+    
     await idle()
 
 if __name__ == "__main__":
