@@ -2,3 +2,6 @@ pyrogram
 tgcrypto
 git+https://github.com/yt-dlp/yt-dlp.git
 aiohttp
+gdown
+yt-dlp
+ffmpeg-python
